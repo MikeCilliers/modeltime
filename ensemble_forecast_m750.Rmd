@@ -21,3 +21,225 @@ library(lubridate)
 library(magrittr)
 
 ```
+
+
+```{r}
+Sys.which("python")
+#reticulate::use_python(" C:/Users/w6005671/Documents/anaconda3/envs/r-gluonts")
+#reticulate::use_python("C:/Users/w6005671/Miniconda3/envs/r-gluonts")
+
+reticulate::py_module_available("gluonts")
+```
+
+```{r}
+m750 %>%
+  group_by(id) %>%
+  group_modify(~ head(.x, 2L))
+
+m750 %>%
+    plot_time_series(date, value, .smooth_period = "3 months", .interactive = FALSE)
+```
+Seasonality Evaluation
+```{r}
+m750 %>%
+    plot_seasonal_diagnostics(
+        date, value,
+        .feature_set = c("month.lbl", "quarter","year"),
+        .interactive = FALSE
+    )
+```
+
+```{r, warning = FALSE, message = FALSE}
+splits <- m750 %>%
+    time_series_split(assess = "12 months", cumulative = TRUE)
+```
+
+
+```{r}
+splits %>%
+    tk_time_series_cv_plan() %>%
+    plot_time_series_cv_plan(date, value, .interactive = FALSE)
+```
+
+
+
+```{r}
+recipe_spec <- recipe(value ~ date, m750) %>%
+    step_timeseries_signature(date) %>%
+    step_rm(matches("(iso$)|(xts$)|(day)|(hour)|(min)|(sec)|(am.pm)")) %>%
+#    step_mutate(Date_year = factor(Date_week, ordered = TRUE)) %>%
+#    step_fourier(Date, period = 365, K = 5) %>%
+#    step_dummy(all_nominal()) %>%
+    step_normalize(contains("index.num"), date_year)
+
+recipe_spec %>% prep() %>% juice()
+```
+Make Sub-Models
+Model - Auto ARIMA
+```{r}
+model_fit_arima <- arima_reg(seasonal_period = 12) %>%
+    set_engine("auto_arima") %>%
+    fit(value ~ date, training(splits))
+
+```
+
+Model - STLM ARIMA
+```{r}
+model_fit_stlm_arima <-  seasonal_reg() %>%
+    set_engine("stlm_arima") %>%
+    fit(value ~ date, training(splits))
+```
+Model - Elastic Net - glmnet 
+```{r}
+model_spec_glmnet <- linear_reg() %>%
+    set_engine("glmnet")
+
+wflw_fit_glmnet <- workflow() %>%
+    add_model(model_spec_glmnet) %>%
+    add_recipe(recipe_spec %>% step_rm(date)) %>%
+    fit(training(splits))
+```
+
+Model - XGBoost
+```{r}
+model_spec_xgboost <- boost_tree() %>%
+    set_engine("xgboost")
+
+set.seed(123)
+wflw_fit_xgboost <- workflow() %>%
+    add_model(model_spec_xgboost) %>%
+    add_recipe(recipe_spec %>% step_rm(date)) %>%
+    fit(training(splits))
+```
+
+Model - NNETAR
+```{r}
+model_spec_nnetar <- nnetar_reg(
+        seasonal_period = 12,
+        non_seasonal_ar = 3,
+        seasonal_ar     = 1
+    ) %>%
+    set_engine("nnetar")
+
+set.seed(123)
+wflw_fit_nnetar <- workflow() %>%
+    add_model(model_spec_nnetar) %>%
+    add_recipe(recipe_spec) %>%
+    fit(training(splits))
+```
+
+Model - Prophet w/ Regressors
+```{r}
+model_spec_prophet <- prophet_reg(
+      seasonality_yearly = TRUE
+    ) %>%
+    set_engine("prophet") 
+
+wflw_fit_prophet <- workflow() %>%
+    add_model(model_spec_prophet) %>%
+    add_recipe(recipe_spec) %>%
+    fit(training(splits))
+```
+
+Model - Random Forest
+```{r}
+model_spec_rf <- rand_forest(trees = 500, min_n = 50) %>%
+  set_engine("randomForest")
+
+workflow_fit_rf <- workflow() %>%
+  add_model(model_spec_rf) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits))
+```
+
+Model - Prophet Boost
+```{r}
+model_spec_prophet_boost <- prophet_boost() %>%
+  set_engine("prophet_xgboost", yearly.seasonality = TRUE) 
+
+workflow_fit_prophet_boost <- workflow() %>%
+  add_model(model_spec_prophet_boost) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits))
+```
+Model - SVM
+```{r}
+workflow_fit_svm <- workflow() %>%
+  add_model(svm_rbf() %>% set_engine("kernlab")) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits))
+```
+Model - STANDARD ETS
+```{r}
+model_spec_ets <- exp_smoothing(
+    seasonal_period = 12,
+    error = "multiplicative",
+    trend = "additive",
+    season = "multiplicative"
+    ) %>% 
+  set_engine("ets")
+
+workflow_fit_ets <- workflow() %>%
+  add_model(model_spec_ets) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits))
+```
+
+Model - earth
+```{r}
+workflow_fit_mars <- workflow() %>%
+  add_model(mars(mode = "regression", prod_degree = 2) %>% set_engine("earth")) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits))
+
+
+```
+
+Model - LIQUIDSVM
+```{r}
+workflow_fit_liquidsvm <- workflow() %>%
+  add_model(svm_rbf() %>% set_engine("liquidSVM") %>% set_mode("regression")) %>%
+  add_recipe(recipe_spec %>% step_rm(date)) %>%
+  fit(training(splits))
+
+workflow_fit_liquidsvm
+```
+
+```{r}
+# Fit a GluonTS DeepAR Model
+model_spec_deepar <- deep_ar(
+    id                    = "id",
+    freq                  = "M",
+    prediction_length     = 24,
+    lookback_length       = 36,
+    epochs                = 10, 
+    num_batches_per_epoch = 50,
+    learn_rate            = 0.001,
+    num_layers            = 2,
+    dropout               = 0.10
+) %>%
+    set_engine("gluonts_deepar")
+
+workflow_fit_deepar <- workflow() %>%
+  add_model(model_spec_deepar) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits))
+
+
+```
+
+
+
+```{r}
+modeltime_table(
+    model_fit_deepar
+) %>%
+    modeltime_calibrate(new_data = testing(m750_splits)) %>%
+    modeltime_forecast(
+        new_data      = testing(m750_splits),
+        actual_data   = m750,
+        conf_interval = 0.95
+    ) %>%
+    plot_modeltime_forecast(.interactive = FALSE)
+```
+
