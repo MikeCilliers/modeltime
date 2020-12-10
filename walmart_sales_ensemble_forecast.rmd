@@ -1,0 +1,364 @@
+---
+title: "Forecasting using timetk andmodeltime"
+author: "Mike Cilliers"
+date: "16/11/2020"
+output: html_document
+---
+
+```{r, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# Time Series Modeling and Machine Learning
+library(tidymodels)
+library(modeltime)
+library(modeltime.ensemble)
+library(modeltime.gluonts)
+
+# Time Series and Data Wrangling
+library(timetk)
+library(tidyverse)
+library(lubridate)
+
+# Data manipulation
+library(magrittr)
+
+
+```
+
+
+```{r}
+setwd("~/R/workspace/tidy_forecast/modeltime/data/")
+
+train_df <- read_csv("train.csv")
+head(train_df)
+
+```
+
+
+```{r}
+store_1_1_tbl <- train_df %>%
+    filter(Store == 1, Dept == 1) %>%
+    select(Date, Weekly_Sales)
+
+store_1_1_tbl
+rm(train_df)
+```
+
+```{r}
+store_1_1_tbl %>%
+    plot_time_series(Date, Weekly_Sales, .smooth_period = "3 months", .interactive = FALSE)
+```
+
+Seasonality Evaluation
+```{r}
+store_1_1_tbl %>%
+    plot_seasonal_diagnostics(
+        Date, Weekly_Sales,
+        .feature_set = c("week", "month.lbl"),
+        .interactive = FALSE
+    )
+```
+Train / Test
+Split your time series into training and testing sets
+Give the objective to forecast 12 weeks of product sales, we use time_series_split() to make a train/test set consisting of 12-weeks of test data (hold out) and the rest for training.
+
+Setting assess = "12 weeks" tells the function to use the last 12-weeks of data as the testing set.
+Setting cumulative = TRUE tells the sampling to use all of the prior data as the training set.
+
+```{r}
+splits <- store_1_1_tbl %>%
+    time_series_split(assess = "12 weeks", cumulative = TRUE)
+```
+Next, visualize the train/test split.
+
+tk_time_series_cv_plan(): Converts the splits object to a data frame
+plot_time_series_cv_plan(): Plots the time series sampling data using the “date” and “value” columns.
+```{r}
+splits %>%
+    tk_time_series_cv_plan() %>%
+    plot_time_series_cv_plan(Date, Weekly_Sales, .interactive = FALSE)
+```
+Feature Engineering
+We’ll make a number of calendar features using recipes. Most of the heavy lifting is done by timetk::step_timeseries_signature(), which generates a series of common time series features. We remove the ones that won’t help. After dummying we have 74 total columns, 72 of which are engineered calendar features.
+
+```{r}
+recipe_spec <- recipe(Weekly_Sales ~ Date, store_1_1_tbl) %>%
+    step_timeseries_signature(Date) %>%
+    step_rm(matches("(iso$)|(xts$)|(day)|(hour)|(min)|(sec)|(am.pm)")) %>%
+    step_mutate(Date_week = factor(Date_week, ordered = TRUE)) %>%
+#    step_fourier(Date, period = 365, K = 5) %>%
+    step_dummy(all_nominal()) %>%
+    step_normalize(contains("index.num"), Date_year)
+
+recipe_spec %>% prep() %>% juice()
+```
+
+Make Sub-Models
+Model - Auto ARIMA
+```{r}
+model_fit_arima <- arima_reg(seasonal_period = 52) %>%
+    set_engine("auto_arima") %>%
+    fit(Weekly_Sales ~ Date, training(splits))
+
+model_fit_arima
+```
+Model - STLM ARIMA
+```{r}
+model_fit_stlm_arima <-  seasonal_reg() %>%
+    set_engine("stlm_arima") %>%
+    fit(Weekly_Sales ~ Date, training(splits))
+
+```
+
+
+
+Model - Elastic Net - glmnet 
+```{r}
+model_spec_glmnet <- linear_reg(penalty = 0.01, mixture = 0.5) %>%
+    set_engine("glmnet")
+
+wflw_fit_glmnet <- workflow() %>%
+    add_model(model_spec_glmnet) %>%
+    add_recipe(recipe_spec %>% step_rm(Date)) %>%
+    fit(training(splits))
+```
+
+Model - XGBoost
+```{r}
+model_spec_xgboost <- boost_tree() %>%
+    set_engine("xgboost")
+
+set.seed(123)
+wflw_fit_xgboost <- workflow() %>%
+    add_model(model_spec_xgboost) %>%
+    add_recipe(recipe_spec %>% step_rm(Date)) %>%
+    fit(training(splits))
+```
+
+Model - NNETAR
+```{r}
+model_spec_nnetar <- nnetar_reg(
+        seasonal_period = 52,
+        non_seasonal_ar = 4,
+        seasonal_ar     = 1
+    ) %>%
+    set_engine("nnetar")
+
+set.seed(123)
+wflw_fit_nnetar <- workflow() %>%
+    add_model(model_spec_nnetar) %>%
+    add_recipe(recipe_spec) %>%
+    fit(training(splits))
+```
+
+Model - Prophet w/ Regressors
+```{r}
+model_spec_prophet <- prophet_reg(
+      seasonality_yearly = TRUE
+    ) %>%
+    set_engine("prophet") 
+
+wflw_fit_prophet <- workflow() %>%
+    add_model(model_spec_prophet) %>%
+    add_recipe(recipe_spec) %>%
+    fit(training(splits))
+```
+
+Model - Random Forest
+```{r}
+model_spec_rf <- rand_forest(trees = 500, min_n = 50) %>%
+  set_engine("randomForest")
+
+workflow_fit_rf <- workflow() %>%
+  add_model(model_spec_rf) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(splits))
+```
+
+Model - Prophet Boost
+```{r}
+model_spec_prophet_boost <- prophet_boost() %>%
+  set_engine("prophet_xgboost", yearly.seasonality = TRUE) 
+
+workflow_fit_prophet_boost <- workflow() %>%
+  add_model(model_spec_prophet_boost) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits))
+```
+
+Model - SVM
+```{r}
+workflow_fit_svm <- workflow() %>%
+  add_model(svm_rbf() %>% set_engine("kernlab")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(splits))
+```
+
+Model - STANDARD ETS
+```{r}
+model_spec_ets <- exp_smoothing(
+    seasonal_period = 52,
+    error = "multiplicative",
+    trend = "additive",
+    season = "multiplicative"
+    ) %>% 
+  set_engine("ets")
+
+workflow_fit_ets <- workflow() %>%
+  add_model(model_spec_ets) %>%
+  add_recipe(recipe_spec) %>%
+  fit(training(splits))
+```
+
+Model - earth
+```{r}
+workflow_fit_mars <- workflow() %>%
+  add_model(mars(mode = "regression", prod_degree = 2) %>% set_engine("earth")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(splits))
+
+
+```
+
+Model - LIQUIDSVM
+```{r}
+workflow_fit_liquidsvm <- workflow() %>%
+  add_model(svm_rbf() %>% set_engine("liquidSVM") %>% set_mode("regression")) %>%
+  add_recipe(recipe_spec %>% step_rm(Date)) %>%
+  fit(training(splits))
+
+workflow_fit_liquidsvm
+```
+
+```{r}
+submodels_tbl <- modeltime_table(
+    model_fit_arima,
+    model_fit_stlm_arima,
+    wflw_fit_glmnet,
+    wflw_fit_xgboost,
+    wflw_fit_nnetar,
+    wflw_fit_prophet,
+    workflow_fit_rf,
+    workflow_fit_prophet_boost,
+    workflow_fit_svm,
+    workflow_fit_ets,
+    workflow_fit_mars,
+    workflow_fit_liquidsvm
+)
+
+submodels_tbl
+```
+```{r}
+submodels_tbl %>% 
+    modeltime_accuracy(testing(splits)) %>%
+    arrange(rmse) %>%
+    table_modeltime_accuracy(.interactive = FALSE) 
+
+# top_models <- submodels_tbl %>% 
+ #   modeltime_accuracy(testing(splits)) %>%
+  #  arrange(rmse) %>%
+   # top_n(8) %>%
+    #select(.model_id)
+```
+
+```{r}
+submodels_tbl %>%
+    modeltime_forecast(
+        new_data    = testing(splits),
+        actual_data = store_1_1_tbl
+    ) %>%
+    plot_modeltime_forecast(.interactive = TRUE)
+```
+```{r}
+ensemble_models_tbl <- submodels_tbl # %>% inner_join(top_models)
+ensemble_models_tbl
+```
+
+Build Modeltime Ensembles
+1. Simple Average Ensemble
+```{r}
+ensemble_fit_avg <- ensemble_models_tbl %>%
+    ensemble_average(type = "mean")
+```
+2. Simple Median Ensemble
+```{r}
+ensemble_fit_med <- ensemble_models_tbl %>%
+    ensemble_average("median")
+
+```
+
+3. Higher Loading on Better Models (Test RMSE)
+```{r}
+ensemble_fit_wt <- ensemble_models_tbl %>%
+    ensemble_weighted(loadings = c(9, 4, 7, 6, 3, 1, 8, 11, 12, 5, 2, 10),
+        scale_loadings = TRUE)
+```
+
+
+```{r}
+ensemble_models_tbl <- modeltime_table(
+    ensemble_fit_avg,
+    ensemble_fit_med,
+    ensemble_fit_wt
+)
+
+ensemble_models_tbl
+```
+
+
+```{r}
+ensemble_models_tbl %>%
+    modeltime_accuracy(testing(splits)) %>%
+  arrange(rmse) %>%
+    table_modeltime_accuracy(.interactive = FALSE)
+```
+```{r}
+ensemble_models_tbl %>%
+    modeltime_forecast(
+        new_data    = testing(splits),
+        actual_data = store_1_1_tbl
+    ) %>%
+    plot_modeltime_forecast(.interactive = TRUE)
+```
+
+Refit on Full Data & Forecast Future
+```{r}
+refit_tbl <- ensemble_models_tbl %>%
+    modeltime_refit(store_1_1_tbl)
+
+refit_tbl %>%
+    modeltime_forecast(
+        h = "39 weeks",
+        actual_data = store_1_1_tbl,
+        conf_interval = 0.95
+    ) %>%
+  filter(.key == "prediction")
+
+refit_tbl %>%
+    modeltime_forecast(
+        h = "39 weeks",
+        actual_data = store_1_1_tbl,
+        conf_interval = 0.95
+    ) %>%
+    plot_modeltime_forecast(.interactive = TRUE)
+
+```
+
+# Fit a GluonTS DeepAR Model
+```{r}
+
+model_fit_deepar <- deep_ar(
+    id                    = "Date",
+    freq                  = "M",
+    prediction_length     = 24,
+    lookback_length       = 36,
+    epochs                = 10, 
+    num_batches_per_epoch = 50,
+    learn_rate            = 0.001,
+    num_layers            = 2,
+    dropout               = 0.10
+) %>%
+    set_engine("gluonts_deepar") %>%
+    fit(Weekly_Sales ~ ., training(splits))
+```
+
